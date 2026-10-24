@@ -36,6 +36,12 @@ final class ResolveLinks
         'post' => Post::class,
     ];
 
+    /**
+     * Text inside these tags is left alone: code is shown as typed, links
+     * already are links, and s/e/i hold the BBCode markup the renderer drops.
+     */
+    private const SKIP_TAGS = ['CODE', 'C', 'URL', 'EMAIL', 's', 'e', 'i'];
+
     public function __construct(private Container $container)
     {
     }
@@ -44,16 +50,31 @@ final class ResolveLinks
     {
         $pattern = '/\b(' . implode('|', array_keys(self::RESOLVERS)) . '):(\d+)\b/';
 
-        if (!preg_match_all($pattern, $xml, $matches, PREG_SET_ORDER)) {
+        // quick exit for the posts without any short syntax, nearly all of them
+        if (!preg_match($pattern, $xml)) {
+            return $xml;
+        }
+
+        // tags at odd indexes, text between them at even indexes: attributes
+        // live inside the tags, so they are never touched
+        $parts = preg_split('/(<[^>]*>)/', $xml, -1, PREG_SPLIT_DELIM_CAPTURE);
+
+        // first pass: collect the ids of the text that will be displayed
+        $idsByType = [];
+        $this->eachDisplayedText($parts, function (string $text) use ($pattern, &$idsByType) {
+            preg_match_all($pattern, $text, $matches, PREG_SET_ORDER);
+            foreach ($matches as [, $type, $id]) {
+                $idsByType[$type][] = (int) $id;
+            }
+
+            return $text;
+        });
+
+        if (!$idsByType) {
             return $xml;
         }
 
         $actor = $request ? RequestUtil::getActor($request) : new Guest();
-
-        $idsByType = [];
-        foreach ($matches as [, $type, $id]) {
-            $idsByType[$type][] = (int) $id;
-        }
 
         $links = [];
         foreach ($idsByType as $type => $ids) {
@@ -62,21 +83,26 @@ final class ResolveLinks
             $links[$type] = $resolver->resolve(array_values(array_unique($ids)), $actor);
         }
 
-        $xml = preg_replace_callback($pattern, function (array $m) use ($links) {
-            $link = $links[$m[1]][(int) $m[2]] ?? null;
+        // second pass: replace in the same text, with the resolved links
+        $parts = $this->eachDisplayedText($parts, function (string $text) use ($pattern, $links) {
+            return preg_replace_callback($pattern, function (array $m) use ($links) {
+                $link = $links[$m[1]][(int) $m[2]] ?? null;
 
-            if ($link === null) {
-                return $m[0];
-            }
+                if ($link === null) {
+                    return $m[0];
+                }
 
-            return sprintf(
-                '<%s label="%s" url="%s">%s</%1$s>',
-                ConfigureParser::TAG,
-                htmlspecialchars($link->label, ENT_QUOTES | ENT_XML1),
-                htmlspecialchars($link->url, ENT_QUOTES | ENT_XML1),
-                $m[0]
-            );
-        }, $xml);
+                return sprintf(
+                    '<%s label="%s" url="%s">%s</%1$s>',
+                    ConfigureParser::TAG,
+                    htmlspecialchars($link->label, ENT_QUOTES | ENT_XML1),
+                    htmlspecialchars($link->url, ENT_QUOTES | ENT_XML1),
+                    $m[0]
+                );
+            }, $text);
+        });
+
+        $xml = implode('', $parts);
 
         // <t> is plain text: the renderer prints it without looking at tags
         if (str_starts_with($xml, '<t>')) {
@@ -84,5 +110,38 @@ final class ResolveLinks
         }
 
         return $xml;
+    }
+
+    /**
+     * Calls $callback on every piece of text outside SKIP_TAGS and puts back
+     * what it returns.
+     *
+     * @param string[] $parts
+     * @return string[]
+     */
+    private function eachDisplayedText(array $parts, callable $callback): array
+    {
+        $skipDepth = 0;
+
+        foreach ($parts as $i => $part) {
+            if ($i % 2 === 1) {
+                // a tag: count how deep we are inside the tags to skip
+                if (preg_match('#^<(/?)([A-Za-z0-9_]+)#', $part, $m) && in_array($m[2], self::SKIP_TAGS, true)) {
+                    if ($m[1] === '/') {
+                        $skipDepth--;
+                    } elseif (!str_ends_with($part, '/>')) {
+                        $skipDepth++;
+                    }
+                }
+
+                continue;
+            }
+
+            if ($skipDepth === 0 && $part !== '') {
+                $parts[$i] = $callback($part);
+            }
+        }
+
+        return $parts;
     }
 }
