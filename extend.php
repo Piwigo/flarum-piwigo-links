@@ -14,7 +14,7 @@ namespace Piwigo\Links;
 use Flarum\Extend;
 
 return [
-    
-    
-    
+    (new Extend\Formatter())
+        ->configure(ConfigureParser::class)
+        ->render(ResolveLinks::class),
 ];
